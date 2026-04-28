@@ -23,7 +23,7 @@ class SessionFactory:
     def __init__(
         self,
         *,
-        impersonate: Union[str, BrowserProfile] = "chrome137",
+        impersonate: Union[str, BrowserProfile] = "chrome136",
         proxies: Optional[Union[Dict[str, str], ProxyRotator]] = None,
         timeout: float = 30.0,
         verify: bool = True,

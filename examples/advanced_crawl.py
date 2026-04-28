@@ -35,7 +35,7 @@ async def advanced_crawl():
 
     async with AsyncHttpClient(
         max_concurrent=50,
-        impersonate="chrome137",
+        impersonate="chrome136",
         proxies=proxies,
         timeout=20,
         default_headers=headers,

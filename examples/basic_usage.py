@@ -8,7 +8,7 @@ from curlx import AsyncHttpClient, SyncHttpClient
 
 
 def sync_example():
-    with SyncHttpClient(impersonate="chrome137", timeout=10) as client:
+    with SyncHttpClient(impersonate="chrome136", timeout=10) as client:
         resp = client.get("https://httpbin.org/get")
         print("Status:", resp.status_code)
         print("JSON:", resp.json())
@@ -16,7 +16,7 @@ def sync_example():
 
 async def async_example():
     async with AsyncHttpClient(
-        impersonate="chrome137",
+        impersonate="chrome136",
         max_concurrent=20,
         timeout=10,
     ) as client:

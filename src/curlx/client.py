@@ -28,7 +28,7 @@ class _BaseClient:
         self,
         *,
         max_concurrent: int = 100,
-        impersonate: str = "chrome137",
+        impersonate: str = "chrome136",
         proxies: Optional[Union[str, Dict[str, str], ProxyRotator]] = None,
         timeout: float = 30.0,
         verify: bool = True,
