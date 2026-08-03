@@ -1,30 +1,77 @@
 """
-curlx CLI – Terminal HTTP client built on curlx SDK.
+curlx CLI - Terminal HTTP client built on curlx SDK.
 
 Usage:
     curlx get  https://api.example.com/users
-    curlx post https://api.example.com/users -H "Content-Type: application/json" --json '{"name":"foo"}'
+    curlx post https://api.example.com/users -H "Content-Type: application/json" \
+        --json '{"name":"foo"}'
     curlx get  https://api.example.com/users --impersonate chrome136 --proxy http://proxy:8080 -v
+
+The response body goes to stdout and everything else to stderr, so the body can
+be piped or redirected on its own. See ``ExitCode`` for the exit-code contract.
 """
 
 from __future__ import annotations
 
+import difflib
 import json
 import time
-from typing import Any, Dict, List, Optional
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import Annotated, Any
 
 import typer
 from rich import box
 from rich.table import Table
-from typing_extensions import Annotated
 
 from curlx.cli_output import OutputFormatter
 from curlx.client import SyncHttpClient
-from curlx.headers import HeaderBuilder
+from curlx.exceptions import (
+    CurlxError,
+    HttpStatusError,
+    ProfileNotFoundError,
+    TransportError,
+)
+
+# Track the SDK default (_BaseClient.__init__). "chrome" is the alias for the
+# latest Chrome, so the CLI does not go stale - and therefore start advertising an
+# outdated fingerprint - every time curl_cffi adds a version.
+DEFAULT_IMPERSONATE = "chrome"
+DEFAULT_TIMEOUT = 30.0
+
+
+class ExitCode(IntEnum):
+    """
+    Process exit codes.
+
+    Code 2 is deliberately absent: Click reserves it for command-line parsing
+    errors and raises it before any curlx code runs.
+    """
+
+    OK = 0
+    USAGE = 1
+    NETWORK = 3
+    HTTP_ERROR = 4
+    OUTPUT_WRITE = 5
+    INTERNAL = 6
+
+
+EXIT_CODE_HELP = (
+    "[bold]Exit codes:[/bold] "
+    "[cyan]0[/cyan] success · "
+    "[cyan]1[/cyan] usage/validation error · "
+    "[cyan]2[/cyan] command-line parsing error · "
+    "[cyan]3[/cyan] network or transport failure · "
+    "[cyan]4[/cyan] HTTP 4xx/5xx with --fail · "
+    "[cyan]5[/cyan] could not write --output file · "
+    "[cyan]6[/cyan] unexpected internal error"
+)
 
 app = typer.Typer(
     name="curlx",
     help="Stealth HTTP client CLI built on curl_cffi",
+    epilog=EXIT_CODE_HELP,
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -32,16 +79,17 @@ app = typer.Typer(
 # ---------------------------------------------------------------------------
 # Shared options
 # ---------------------------------------------------------------------------
+UrlArgument = Annotated[str, typer.Argument(help="Target URL")]
 HeaderOption = Annotated[
-    Optional[List[str]],
+    list[str] | None,
     typer.Option(
         "--header",
         "-H",
-        help="Add a header (can be used multiple times). Format: 'Key: Value'",
+        help="Add a header (repeatable). Format: 'Key: Value', or 'Key;' to send it empty",
     ),
 ]
 ProxyOption = Annotated[
-    Optional[str],
+    str | None,
     typer.Option("--proxy", help="Proxy URL, e.g. http://user:pass@host:8080"),
 ]
 ImpersonateOption = Annotated[
@@ -53,20 +101,24 @@ TimeoutOption = Annotated[
     typer.Option("--timeout", "-t", help="Request timeout in seconds"),
 ]
 JsonOption = Annotated[
-    Optional[str],
+    str | None,
     typer.Option("--json", "-j", help="JSON body string"),
 ]
 DataOption = Annotated[
-    Optional[str],
+    str | None,
     typer.Option("--data", "-d", help="Raw body string"),
 ]
 OutputOption = Annotated[
-    Optional[str],
+    str | None,
     typer.Option("--output", "-o", help="Write response body to file"),
 ]
 PrettyOption = Annotated[
     bool,
-    typer.Option("--pretty", "-p", help="Pretty-print JSON output"),
+    typer.Option(
+        "--pretty/--no-pretty",
+        "-p/-P",
+        help="Pretty-print JSON output (interactive terminal only; piped output is verbatim)",
+    ),
 ]
 VerboseOption = Annotated[
     bool,
@@ -81,275 +133,336 @@ InsecureOption = Annotated[
     typer.Option("--insecure", "-k", help="Disable SSL certificate verification"),
 ]
 RefererOption = Annotated[
-    Optional[str],
+    str | None,
     typer.Option("--referer", "-e", help="Referer header"),
 ]
 UaOption = Annotated[
-    Optional[str],
+    str | None,
     typer.Option("--user-agent", "-A", help="Custom User-Agent string"),
+]
+FailOption = Annotated[
+    bool,
+    typer.Option("--fail", "-f", help="Exit with code 4 when the response is 4xx or 5xx"),
 ]
 
 
-def _parse_headers(header_list: Optional[List[str]]) -> Dict[str, str]:
-    """Parse 'Key: Value' strings into a dict."""
-    headers: Dict[str, str] = {}
-    if not header_list:
-        return headers
-    for h in header_list:
-        if ":" not in h:
-            typer.secho(f"Warning: invalid header format '{h}', expected 'Key: Value'", fg=typer.colors.YELLOW)
+@dataclass(frozen=True)
+class RequestOptions:
+    """
+    Everything a verb command collects.
+
+    Bundling these keeps ``_do_request`` off a 15-argument positional signature,
+    where inserting a parameter silently misaligns every call site.
+    """
+
+    method: str
+    url: str
+    headers: list[str] | None = None
+    proxy: str | None = None
+    impersonate: str = DEFAULT_IMPERSONATE
+    timeout: float = DEFAULT_TIMEOUT
+    json_body: str | None = None
+    data_body: str | None = None
+    output: str | None = None
+    pretty: bool = True
+    verbose: bool = False
+    no_color: bool = False
+    insecure: bool = False
+    referer: str | None = None
+    user_agent: str | None = None
+    fail: bool = False
+
+
+def _parse_headers(header_list: list[str] | None, fmt: OutputFormatter) -> dict[str, str]:
+    """
+    Parse curl-style ``-H`` arguments into a dict.
+
+    ``Key: Value`` sets a header and ``Key;`` sends it with an empty value, as in
+    curl. The client takes a dict, so a repeated key can only be last-wins —
+    warn rather than drop the earlier value silently.
+    """
+    headers: dict[str, str] = {}
+    seen: dict[str, str] = {}  # lowercased name -> spelling already stored
+    for raw in header_list or []:
+        if ":" in raw:
+            name, value = raw.split(":", 1)
+        elif raw.endswith(";"):
+            name, value = raw[:-1], ""
+        else:
+            fmt.print_warning(
+                f"Ignoring malformed header {raw!r}, expected 'Key: Value' or 'Key;'"
+            )
             continue
-        key, value = h.split(":", 1)
-        headers[key.strip()] = value.strip()
+
+        name, value = name.strip(), value.strip()
+        if not name:
+            fmt.print_warning(f"Ignoring header {raw!r} with an empty name")
+            continue
+
+        lowered = name.lower()
+        if lowered in seen:
+            fmt.print_warning(f"Duplicate header {name!r} overrides the earlier value")
+            headers.pop(seen[lowered], None)
+        seen[lowered] = name
+        headers[name] = value
     return headers
 
 
+def _profile_suggestion(name: str) -> str:
+    """Build a 'did you mean' hint for an unknown impersonation profile."""
+    from curlx.fingerprint import list_profiles
+
+    profiles = list_profiles()
+    close = difflib.get_close_matches(name, profiles, n=3, cutoff=0.4)
+    if close:
+        return "Did you mean: " + ", ".join(close) + "?  (curlx profiles lists them all)"
+    return f"{len(profiles)} profiles are available; run 'curlx profiles' to list them."
+
+
+def _is_known_profile(name: str) -> bool:
+    from curlx.fingerprint import list_profiles
+
+    return name in list_profiles()
+
+
 def _build_client(
-    proxy: Optional[str],
-    impersonate: str,
-    timeout: float,
-    insecure: bool,
-    headers: Dict[str, str],
+    opts: RequestOptions,
+    headers: dict[str, str],
+    fmt: OutputFormatter,
 ) -> SyncHttpClient:
-    """Build a SyncHttpClient from CLI arguments."""
+    """Build a SyncHttpClient from CLI arguments, reporting a bad profile cleanly."""
     proxies = None
-    if proxy:
-        proxies = {"http": proxy, "https": proxy}
+    if opts.proxy:
+        proxies = {"http": opts.proxy, "https": opts.proxy}
 
-    return SyncHttpClient(
-        impersonate=impersonate,
-        proxies=proxies,
-        timeout=timeout,
-        verify=not insecure,
-        default_headers=headers,
-    )
+    try:
+        return SyncHttpClient(
+            impersonate=opts.impersonate,
+            proxies=proxies,
+            timeout=opts.timeout,
+            verify=not opts.insecure,
+            default_headers=headers,
+        )
+    except (ProfileNotFoundError, ValueError) as exc:
+        # fingerprint.get_profile still raises a bare ValueError, so accept both.
+        # A ValueError raised for any other reason is not a profile problem and
+        # must not be mislabelled as one.
+        if _is_known_profile(opts.impersonate):
+            raise
+        fmt.print_error(
+            f"Unknown impersonation profile: {opts.impersonate!r}",
+            detail=_profile_suggestion(opts.impersonate),
+        )
+        raise typer.Exit(code=ExitCode.USAGE) from exc
 
 
-def _do_request(
-    method: str,
-    url: str,
-    headers: Optional[List[str]],
-    proxy: Optional[str],
-    impersonate: str,
-    timeout: float,
-    json_body: Optional[str],
-    data_body: Optional[str],
-    output: Optional[str],
-    pretty: bool,
-    verbose: bool,
-    no_color: bool,
-    insecure: bool,
-    referer: Optional[str],
-    user_agent: Optional[str],
-) -> None:
+def _do_request(opts: RequestOptions, fmt: OutputFormatter) -> None:
     """Execute the HTTP request and print formatted output."""
-    fmt = OutputFormatter(no_color=no_color, verbose=verbose)
+    parsed_headers = _parse_headers(opts.headers, fmt)
+    if opts.referer:
+        parsed_headers["Referer"] = opts.referer
+    if opts.user_agent:
+        parsed_headers["User-Agent"] = opts.user_agent
 
-    parsed_headers = _parse_headers(headers)
-    if referer:
-        parsed_headers["Referer"] = referer
-    if user_agent:
-        parsed_headers["User-Agent"] = user_agent
+    client = _build_client(opts, parsed_headers, fmt)
 
-    client = _build_client(proxy, impersonate, timeout, insecure, parsed_headers)
-
-    request_kwargs: Dict[str, Any] = {}
-    if json_body:
+    request_kwargs: dict[str, Any] = {}
+    if opts.json_body:
         try:
-            request_kwargs["json"] = json.loads(json_body)
+            request_kwargs["json"] = json.loads(opts.json_body)
         except json.JSONDecodeError as exc:
             fmt.print_error("Invalid JSON body", detail=str(exc))
-            raise typer.Exit(code=1)
-    elif data_body:
-        request_kwargs["data"] = data_body
+            raise typer.Exit(code=ExitCode.USAGE) from exc
+    elif opts.data_body:
+        request_kwargs["data"] = opts.data_body
 
     start = time.perf_counter()
     try:
         with client:
-            resp = client.request(method, url, **request_kwargs)
-    except Exception as exc:
+            resp = client.request(opts.method, opts.url, **request_kwargs)
+    except HttpStatusError as exc:
+        fmt.print_error(f"HTTP {exc.status_code}", detail=str(exc))
+        raise typer.Exit(code=ExitCode.HTTP_ERROR) from exc
+    except TransportError as exc:
+        fmt.print_error(f"Request failed: {type(exc).__name__}", detail=str(exc))
+        raise typer.Exit(code=ExitCode.NETWORK) from exc
+    except CurlxError as exc:
+        # Retry exhaustion, open circuit breaker, exhausted proxy pool, ...
         fmt.print_error(f"{type(exc).__name__}", detail=str(exc))
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=ExitCode.NETWORK) from exc
 
     elapsed_ms = (time.perf_counter() - start) * 1000
     content_length = len(resp.content)
 
     # Summary
     fmt.print_request_summary(
-        method=method,
+        method=opts.method,
         url=resp.url,
         status_code=resp.status_code,
         elapsed_ms=elapsed_ms,
         content_length=content_length,
     )
 
-    if verbose:
-        fmt.console.print()
+    if opts.verbose:
+        fmt.blank_line()
         fmt.print_verbose_meta(
             request_headers=parsed_headers,
             cookies=dict(resp.cookies) if resp.cookies else None,
         )
-        fmt.print_headers(dict(resp.headers))
-        fmt.console.print()
+        # curl_cffi's Headers can yield None values; normalize for display.
+        fmt.print_headers({k: v or "" for k, v in resp.headers.items()})
+        fmt.blank_line()
 
     # Body
-    if output:
-        fmt.write_to_file(resp.text, output)
+    if opts.output:
+        try:
+            fmt.write_to_file(resp.text, opts.output)
+        except OSError as exc:
+            fmt.print_error(f"Cannot write to {opts.output!r}", detail=str(exc))
+            raise typer.Exit(code=ExitCode.OUTPUT_WRITE) from exc
     else:
         ct = resp.headers.get("content-type", "")
         fmt.print_body(
             resp.content,
             content_type=ct,
-            pretty=pretty,
+            pretty=opts.pretty,
             title=f"Body ({content_length} bytes)",
         )
+
+    if opts.fail and resp.status_code >= 400:
+        fmt.print_error(
+            f"HTTP {resp.status_code} and --fail was given",
+            detail=f"{opts.method} {resp.url}",
+        )
+        raise typer.Exit(code=ExitCode.HTTP_ERROR)
+
+
+def _dispatch(opts: RequestOptions) -> None:
+    """Run a request, turning any failure into a clean message and an exit code."""
+    fmt = OutputFormatter(no_color=opts.no_color, verbose=opts.verbose)
+    try:
+        _do_request(opts, fmt)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        fmt.print_unexpected(exc)
+        raise typer.Exit(code=ExitCode.INTERNAL) from exc
 
 
 # ---------------------------------------------------------------------------
 # Commands
+#
+# The verbs share one parameter block per shape, built by the factories below,
+# so adding an option means editing one signature instead of six. Each factory
+# returns a real function with real annotations, so every command still has its
+# own introspectable --help.
 # ---------------------------------------------------------------------------
-@app.command(rich_help_panel="HTTP Methods")
-def get(
-    url: Annotated[str, typer.Argument(help="Target URL")],
-    header: HeaderOption = None,
-    proxy: ProxyOption = None,
-    impersonate: ImpersonateOption = "chrome136",
-    timeout: TimeoutOption = 30.0,
-    output: OutputOption = None,
-    pretty: PrettyOption = True,
-    verbose: VerboseOption = False,
-    no_color: NoColorOption = False,
-    insecure: InsecureOption = False,
-    referer: RefererOption = None,
-    user_agent: UaOption = None,
-) -> None:
-    """Send a GET request."""
-    _do_request(
-        "GET", url, header, proxy, impersonate, timeout,
-        None, None, output, pretty, verbose, no_color, insecure, referer, user_agent,
-    )
+def _make_bodyless_command(method: str) -> Callable[..., None]:
+    """Build the command function for a verb that sends no request body."""
+
+    def command(
+        url: UrlArgument,
+        header: HeaderOption = None,
+        proxy: ProxyOption = None,
+        impersonate: ImpersonateOption = DEFAULT_IMPERSONATE,
+        timeout: TimeoutOption = DEFAULT_TIMEOUT,
+        output: OutputOption = None,
+        pretty: PrettyOption = True,
+        verbose: VerboseOption = False,
+        no_color: NoColorOption = False,
+        insecure: InsecureOption = False,
+        referer: RefererOption = None,
+        user_agent: UaOption = None,
+        fail: FailOption = False,
+    ) -> None:
+        _dispatch(
+            RequestOptions(
+                method=method,
+                url=url,
+                headers=header,
+                proxy=proxy,
+                impersonate=impersonate,
+                timeout=timeout,
+                output=output,
+                pretty=pretty,
+                verbose=verbose,
+                no_color=no_color,
+                insecure=insecure,
+                referer=referer,
+                user_agent=user_agent,
+                fail=fail,
+            )
+        )
+
+    command.__name__ = method.lower()
+    command.__doc__ = f"Send a {method} request."
+    return command
 
 
-@app.command(rich_help_panel="HTTP Methods")
-def post(
-    url: Annotated[str, typer.Argument(help="Target URL")],
-    header: HeaderOption = None,
-    proxy: ProxyOption = None,
-    impersonate: ImpersonateOption = "chrome136",
-    timeout: TimeoutOption = 30.0,
-    json_body: JsonOption = None,
-    data: DataOption = None,
-    output: OutputOption = None,
-    pretty: PrettyOption = True,
-    verbose: VerboseOption = False,
-    no_color: NoColorOption = False,
-    insecure: InsecureOption = False,
-    referer: RefererOption = None,
-    user_agent: UaOption = None,
-) -> None:
-    """Send a POST request."""
-    _do_request(
-        "POST", url, header, proxy, impersonate, timeout,
-        json_body, data, output, pretty, verbose, no_color, insecure, referer, user_agent,
-    )
+def _make_body_command(method: str) -> Callable[..., None]:
+    """Build the command function for a verb that can carry a request body."""
+
+    def command(
+        url: UrlArgument,
+        header: HeaderOption = None,
+        proxy: ProxyOption = None,
+        impersonate: ImpersonateOption = DEFAULT_IMPERSONATE,
+        timeout: TimeoutOption = DEFAULT_TIMEOUT,
+        json_body: JsonOption = None,
+        data: DataOption = None,
+        output: OutputOption = None,
+        pretty: PrettyOption = True,
+        verbose: VerboseOption = False,
+        no_color: NoColorOption = False,
+        insecure: InsecureOption = False,
+        referer: RefererOption = None,
+        user_agent: UaOption = None,
+        fail: FailOption = False,
+    ) -> None:
+        _dispatch(
+            RequestOptions(
+                method=method,
+                url=url,
+                headers=header,
+                proxy=proxy,
+                impersonate=impersonate,
+                timeout=timeout,
+                json_body=json_body,
+                data_body=data,
+                output=output,
+                pretty=pretty,
+                verbose=verbose,
+                no_color=no_color,
+                insecure=insecure,
+                referer=referer,
+                user_agent=user_agent,
+                fail=fail,
+            )
+        )
+
+    command.__name__ = method.lower()
+    command.__doc__ = f"Send a {method} request."
+    return command
 
 
-@app.command(rich_help_panel="HTTP Methods")
-def put(
-    url: Annotated[str, typer.Argument(help="Target URL")],
-    header: HeaderOption = None,
-    proxy: ProxyOption = None,
-    impersonate: ImpersonateOption = "chrome136",
-    timeout: TimeoutOption = 30.0,
-    json_body: JsonOption = None,
-    data: DataOption = None,
-    output: OutputOption = None,
-    pretty: PrettyOption = True,
-    verbose: VerboseOption = False,
-    no_color: NoColorOption = False,
-    insecure: InsecureOption = False,
-    referer: RefererOption = None,
-    user_agent: UaOption = None,
-) -> None:
-    """Send a PUT request."""
-    _do_request(
-        "PUT", url, header, proxy, impersonate, timeout,
-        json_body, data, output, pretty, verbose, no_color, insecure, referer, user_agent,
-    )
+_VERBS: tuple[tuple[str, bool], ...] = (
+    ("GET", False),
+    ("POST", True),
+    ("PUT", True),
+    ("PATCH", True),
+    ("DELETE", True),
+    ("HEAD", False),
+)
 
-
-@app.command(rich_help_panel="HTTP Methods")
-def patch(
-    url: Annotated[str, typer.Argument(help="Target URL")],
-    header: HeaderOption = None,
-    proxy: ProxyOption = None,
-    impersonate: ImpersonateOption = "chrome136",
-    timeout: TimeoutOption = 30.0,
-    json_body: JsonOption = None,
-    data: DataOption = None,
-    output: OutputOption = None,
-    pretty: PrettyOption = True,
-    verbose: VerboseOption = False,
-    no_color: NoColorOption = False,
-    insecure: InsecureOption = False,
-    referer: RefererOption = None,
-    user_agent: UaOption = None,
-) -> None:
-    """Send a PATCH request."""
-    _do_request(
-        "PATCH", url, header, proxy, impersonate, timeout,
-        json_body, data, output, pretty, verbose, no_color, insecure, referer, user_agent,
-    )
-
-
-@app.command(rich_help_panel="HTTP Methods")
-def delete(
-    url: Annotated[str, typer.Argument(help="Target URL")],
-    header: HeaderOption = None,
-    proxy: ProxyOption = None,
-    impersonate: ImpersonateOption = "chrome136",
-    timeout: TimeoutOption = 30.0,
-    json_body: JsonOption = None,
-    data: DataOption = None,
-    output: OutputOption = None,
-    pretty: PrettyOption = True,
-    verbose: VerboseOption = False,
-    no_color: NoColorOption = False,
-    insecure: InsecureOption = False,
-    referer: RefererOption = None,
-    user_agent: UaOption = None,
-) -> None:
-    """Send a DELETE request."""
-    _do_request(
-        "DELETE", url, header, proxy, impersonate, timeout,
-        json_body, data, output, pretty, verbose, no_color, insecure, referer, user_agent,
-    )
-
-
-@app.command(rich_help_panel="HTTP Methods")
-def head(
-    url: Annotated[str, typer.Argument(help="Target URL")],
-    header: HeaderOption = None,
-    proxy: ProxyOption = None,
-    impersonate: ImpersonateOption = "chrome136",
-    timeout: TimeoutOption = 30.0,
-    verbose: VerboseOption = False,
-    no_color: NoColorOption = False,
-    insecure: InsecureOption = False,
-    referer: RefererOption = None,
-    user_agent: UaOption = None,
-) -> None:
-    """Send a HEAD request (headers only)."""
-    _do_request(
-        "HEAD", url, header, proxy, impersonate, timeout,
-        None, None, None, False, verbose, no_color, insecure, referer, user_agent,
-    )
+for _method, _has_body in _VERBS:
+    _factory = _make_body_command if _has_body else _make_bodyless_command
+    app.command(name=_method.lower(), rich_help_panel="HTTP Methods")(_factory(_method))
 
 
 # ---------------------------------------------------------------------------
 # Utility commands
 # ---------------------------------------------------------------------------
-@app.command(rich_help_panel="Utilities")
+@app.command(name="profiles", rich_help_panel="Utilities")
 def profiles() -> None:
     """List supported browser impersonation profiles."""
     from curlx.fingerprint import list_profiles
@@ -362,12 +475,15 @@ def profiles() -> None:
     for name in list_profiles():
         table.add_row(name, f"Impersonate {name}")
 
+    # The table is this command's payload, so it belongs on stdout.
     fmt.console.print(table)
 
 
-@app.command(rich_help_panel="Utilities")
+@app.command(name="user-agents", rich_help_panel="Utilities")
 def user_agents(
-    browser: Annotated[str, typer.Argument(help="Browser name (chrome, firefox, safari, edge)")] = "chrome",
+    browser: Annotated[
+        str, typer.Argument(help="Browser name (chrome, firefox, safari, edge)")
+    ] = "chrome",
 ) -> None:
     """Show sample User-Agent strings."""
     from curlx.headers import rotate_user_agent

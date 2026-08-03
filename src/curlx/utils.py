@@ -4,9 +4,8 @@ Utility helpers.
 
 import logging
 import random
-import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 def get_logger(name: str = "curlx") -> logging.Logger:
@@ -33,7 +32,7 @@ def jitter(base: float, jitter_factor: float = 0.1) -> float:
     return base + random.uniform(-base * jitter_factor, base * jitter_factor)
 
 
-def merge_dicts(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def merge_dicts(base: dict[str, Any], override: dict[str, Any] | None) -> dict[str, Any]:
     """Merge two dicts; override wins on key collision."""
     result = dict(base)
     if override:

@@ -7,7 +7,7 @@ name = "curlx"
 version = "0.1.0"
 description = "Production-grade async/sync HTTP client SDK built on curl_cffi for stealth web crawling"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 license = {text = "MIT"}
 authors = [
     {name = "mamidevs", email = "dev@mamidevs.com"}
@@ -18,21 +18,18 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Internet :: WWW/HTTP",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "curl_cffi>=0.10.0",
-    "tenacity>=8.0.0",
-    "pydantic>=2.0.0",
+    # 0.16 is the floor the impersonate profile table actually requires
+    # (chrome146 / safari2601 / firefox147 / tor145) and the first release
+    # exposing the typed curl_cffi.requests.exceptions hierarchy we map onto.
+    "curl_cffi>=0.16.0",
     "typer>=0.12.0",
     "rich>=13.0.0",
-    "typing-extensions>=4.0.0",
 ]
 
 [project.optional-dependencies]
@@ -58,14 +55,41 @@ curlx = "curlx.cli:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 addopts = "--cov=curlx --cov-report=term-missing --cov-fail-under=70"
+markers = [
+    "integration: exercises real curl_cffi and real network; deselect with -m 'not integration'",
+]
+
+[tool.coverage.run]
+source = ["curlx"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    "B008",    # typer declares defaults via function calls in signatures
+    "SIM108",  # ternaries are not always clearer than if/else
+    "RUF022",  # __all__ is grouped by topic with comments, not sorted
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+files = ["src/curlx"]

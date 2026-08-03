@@ -27,6 +27,13 @@ htmlcov/
 .pytest_cache/
 .tox/
 
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+
+# Generated artifacts
+graphify-out/
+
 # OS
 .DS_Store
 Thumbs.db

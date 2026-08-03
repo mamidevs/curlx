@@ -2,8 +2,7 @@
 Tests for AsyncHttpClient and SyncHttpClient.
 """
 
-import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -65,9 +64,11 @@ class TestSyncHttpClient:
     def test_get_request(self):
         fake_raw = FakeRawResponse(status_code=200, content=b'{"sync": true}')
 
-        with SyncHttpClient() as client:
-            with patch.object(client.session, "request", return_value=fake_raw) as mock_req:
-                resp = client.get("https://example.com/test")
-                assert resp.status_code == 200
-                assert resp.json() == {"sync": True}
-                mock_req.assert_called_once()
+        with (
+            SyncHttpClient() as client,
+            patch.object(client.session, "request", return_value=fake_raw) as mock_req,
+        ):
+            resp = client.get("https://example.com/test")
+            assert resp.status_code == 200
+            assert resp.json() == {"sync": True}
+            mock_req.assert_called_once()

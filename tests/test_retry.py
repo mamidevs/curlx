@@ -50,6 +50,13 @@ class TestWithRetry:
 
     @pytest.mark.asyncio
     async def test_no_retry_on_non_retryable_status(self):
+        """
+        A non-retryable failure must surface UNCHANGED.
+
+        This used to assert `RetryExhaustedError`, which was wrong twice over:
+        nothing was ever retried (call_count == 1), and the wrapping meant a
+        caller writing `except HttpStatusError` never fired.
+        """
         call_count = 0
 
         @with_retry(max_attempts=3)
@@ -58,9 +65,36 @@ class TestWithRetry:
             call_count += 1
             raise HttpStatusError(404, "not found")
 
-        with pytest.raises(RetryExhaustedError):
+        with pytest.raises(HttpStatusError) as excinfo:
             await do_it()
+        assert excinfo.value.status_code == 404
         assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_non_retryable_exception_is_not_wrapped(self):
+        """A bug in the caller's own code must not masquerade as a retry failure."""
+
+        @with_retry(max_attempts=3)
+        async def do_it():
+            raise ValueError("caller bug")
+
+        with pytest.raises(ValueError, match="caller bug"):
+            await do_it()
+
+    @pytest.mark.asyncio
+    async def test_reported_attempt_count_is_real(self):
+        """`attempts` used to always report max_attempts regardless of reality."""
+        calls = 0
+
+        @with_retry(max_attempts=3, min_wait=0.01, max_wait=0.02)
+        async def do_it():
+            nonlocal calls
+            calls += 1
+            raise ConnectionError("down")
+
+        with pytest.raises(RetryExhaustedError) as excinfo:
+            await do_it()
+        assert excinfo.value.attempts == calls == 3
 
     def test_sync_retry(self):
         call_count = 0

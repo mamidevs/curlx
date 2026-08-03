@@ -4,7 +4,6 @@ Tests for curlx CLI.
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 from typer.testing import CliRunner
 
 from curlx.cli import app
