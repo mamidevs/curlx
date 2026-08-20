@@ -30,6 +30,7 @@ from curlx.exceptions import (
     HttpStatusError,
     ProxyError,
     ProxyPoolExhaustedError,
+    RetryableResponseError,
     RetryExhaustedError,
     TimeoutExceededError,
     TlsError,
@@ -56,6 +57,11 @@ DEFAULT_RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
     TimeoutExceededError,
     TlsError,  # transient handshake failures; see NON_RETRYABLE_EXCEPTIONS
     ProxyError,  # a single bad proxy; see NON_RETRYABLE_EXCEPTIONS
+    # A 200 the caller's validator rejected as transient. Its siblings
+    # IdentityStaleError / IdentityExhaustedError are deliberately absent: this
+    # decorator can only re-issue the same request, and neither of those clears
+    # without a warm-up or a fresh identity first. BoundSession handles them.
+    RetryableResponseError,
     # Raw curl_cffi types, for callers who bypass map_transport_error. These
     # derive from OSError rather than the builtins below, so both sets matter.
     _curl_exc.ConnectionError,  # includes DNSError, SSLError
@@ -122,27 +128,36 @@ class _Decision(NamedTuple):
     propagate: bool
 
 
-class _RetryPolicy:
+class RetryPolicy:
     """
     The retry decision logic, shared verbatim by the sync and async wrappers.
 
     Keeping it here is what lets each wrapper be a ten-line loop whose only
     difference is ``await`` - previously the two copies drifted apart and every
     bug had to be fixed twice.
+
+    Public so that callers running their own attempt loop - :class:`
+    curlx.identity.BoundSession` is the in-tree example - reuse this backoff
+    instead of writing a second one. Two hand-rolled backoffs in the same
+    codebase reliably become two *different* backoffs: same intent, different
+    distribution, and only one of them respects ``Retry-After``.
+
+    The object is a pure decision function over ``(exception, attempt)``; it
+    holds no per-call state, so one instance can serve many concurrent loops.
     """
 
     def __init__(
         self,
         *,
-        func_name: str,
-        max_attempts: int,
-        min_wait: float,
-        max_wait: float,
-        retryable_exceptions: tuple[type[BaseException], ...] | None,
-        retryable_status_codes: frozenset[int] | None,
-        on_retry: Callable[[Exception, int], None] | None,
-        respect_retry_after: bool,
-        fallback: Any,
+        func_name: str = "retry",
+        max_attempts: int = 3,
+        min_wait: float = 1.0,
+        max_wait: float = 10.0,
+        retryable_exceptions: tuple[type[BaseException], ...] | None = None,
+        retryable_status_codes: frozenset[int] | None = None,
+        on_retry: Callable[[Exception, int], None] | None = None,
+        respect_retry_after: bool = True,
+        fallback: Any = _UNSET,
     ) -> None:
         self.func_name = func_name
         self.max_attempts = max_attempts
@@ -310,7 +325,7 @@ def with_retry(
         )
 
     def decorator(func: Callable[P, R]) -> Callable[P, R]:
-        policy = _RetryPolicy(
+        policy = RetryPolicy(
             func_name=_callable_name(func),
             max_attempts=max_attempts,
             min_wait=min_wait,
@@ -542,6 +557,7 @@ __all__ = [
     "DEFAULT_RETRYABLE_EXCEPTIONS",
     "DEFAULT_RETRYABLE_STATUS_CODES",
     "NON_RETRYABLE_EXCEPTIONS",
+    "RetryPolicy",
     "CircuitBreaker",
     "is_retryable",
     "with_retry",

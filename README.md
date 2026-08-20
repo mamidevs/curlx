@@ -273,6 +273,85 @@ itself, so **transport failures always count; 4xx/5xx responses only count when 
 was built with `raise_for_status=True`** — otherwise a bad status is a perfectly ordinary
 return value it never sees.
 
+## Semantic validation — when 200 is not success
+
+On most real targets `status_code == 200` is not a success criterion. An empty
+body, a session that drifted to another tenant's data, and a WAF interstitial
+all arrive as a well-formed 200 and raise nothing. Only the caller knows the
+difference, so the caller supplies it:
+
+```python
+from curlx import AsyncHttpClient, RetryableResponseError, IdentityStaleError
+
+def validate(resp):
+    if not resp.content:
+        raise RetryableResponseError("empty body", response=resp)
+    if resp.json().get("regionId") != expected:
+        raise IdentityStaleError("binding drifted", response=resp)
+
+async with AsyncHttpClient(validate=validate) as client:
+    resp = await client.get("https://api.example.com/items")
+```
+
+The verdict is the exception type:
+
+| Exception | Meaning | Who resolves it |
+|---|---|---|
+| `RetryableResponseError` | transient garbage, ask again | `with_retry` or `BoundSession` |
+| `IdentityStaleError` | binding drifted, re-warm first | `BoundSession` |
+| `IdentityExhaustedError` | budget spent, new identity needed | `BoundSession` |
+| `ResponseInvalidError` | terminal — do not retry | the caller |
+
+Only `RetryableResponseError` is in the default retryable set. The two identity
+errors are deliberately excluded: `with_retry` can only re-issue the same
+request, which against a stale or spent identity burns the attempt budget and
+then reports a network failure for what is really a binding problem.
+
+`validate` runs inside the request's error path — error hooks fire, and a
+rejection carrying `blames_proxy=True` retires the proxy exactly as a transport
+failure would. It runs *outside* the circuit breaker on purpose: a breaker that
+counted rejections would open, and then refuse the very warm-up request that
+would fix a stale identity.
+
+## Bound identities
+
+A client is stateless as far as the target is concerned; a session bound to a
+store, region or tenant is not. That binding has to be established, can drift
+silently, and can be spent when the quota is counted per session rather than
+rated per second — in which case slowing down buys nothing and only a fresh
+identity resets the counter.
+
+```python
+from curlx import AsyncHttpClient, Identity, IdentityPool, RateLimiter
+
+async def warm_up(client, identity):
+    await client.post("https://api.example.com/session/region",
+                      json={"regionId": identity.payload})
+
+limiter = RateLimiter(20, burst=20, per_host=True)
+
+async with IdentityPool(
+    [Identity("north", payload=1), Identity("south", payload=2)],
+    client_factory=lambda i: AsyncHttpClient(rate_limiter=limiter,
+                                             validate=make_validator(i)),
+    warmup=warm_up,
+    limiter=limiter,
+) as pool:
+    resp = await pool["north"].get("https://api.example.com/catalogue")
+```
+
+Two topology rules the pool encodes:
+
+- **The limiter is shared.** Giving each of N sessions its own limiter at `rps`
+  multiplies the real rate by N, and the total is what the target measures.
+- **The gate is not, by default.** A per-session quota running out says nothing
+  about the other sessions. Pass `gate_scope="shared"` when the limit is
+  per-IP and everyone is blocked at once.
+
+`BoundSession.recycle()` warms the replacement client *before* it becomes the
+live one. Swapping first leaves a window in which workers hit an unwarmed
+session; those responses read as drift, which triggers another recycle.
+
 ## Proxy rotation
 
 ```python
@@ -296,6 +375,47 @@ bring the pool back.
 
 `proxies` also accepts a plain URL string, or a per-scheme `{"http": ..., "https": ...}`
 dict which is applied verbatim to every request (no rotation).
+
+### Health: cooldown instead of permanent retirement
+
+Permanent retirement is right for a small pool you own, and wrong for a large or
+rented one — over a long run it drains the pool until the last invalidation
+becomes an outage. Pass `cooldown` to bench a failing proxy for an
+exponentially growing interval instead, after which it returns on its own:
+
+```python
+rotator = ProxyRotator([...], cooldown=120.0)   # 0 (default) = retire permanently
+rotator.report(url, ok=False)                   # benched, still a pool member
+rotator.available                               # how many could serve right now
+```
+
+Blame can be scoped. A proxy the *target* refuses is still fine everywhere else,
+so retiring it globally throws away capacity for nothing:
+
+```python
+rotator.report(url, ok=False, host="shop.example.com", blocked=True)
+```
+
+### Where proxies come from
+
+`ProxyProvider` is the protocol for the supply side, so a literal list and a
+leased pool look the same to the caller:
+
+```python
+from curlx import StaticProvider, EndpointProvider
+
+StaticProvider.from_urls([...], cooldown=120.0)
+
+EndpointProvider(                       # re-reads the pool every `ttl` seconds
+    "https://pool.example.com/lease",
+    parse=lambda body: body["proxies"], # every vendor invents its own shape
+    ttl=300.0,
+    cooldown=120.0,
+)
+```
+
+A refresh that fails keeps the previous pool rather than taking the crawl down —
+an outage caused by the recovery mechanism is still an outage.
 
 ## Redirect safety
 
@@ -516,6 +636,7 @@ asyncio.run(main())
 
 - [`examples/basic_usage.py`](examples/basic_usage.py) – sync, async, `fetch_all` on both clients, error handling
 - [`examples/advanced_crawl.py`](examples/advanced_crawl.py) – the full resilience stack
+- [`examples/bound_identity_crawl.py`](examples/bound_identity_crawl.py) – N identities, one rate budget
 
 ## Architecture
 
@@ -526,7 +647,8 @@ curlx/
 ├── retry.py        # Retry decorator, retry predicate & circuit breaker
 ├── ratelimit.py    # Token-bucket RateLimiter (sync + async)
 ├── cookies.py      # CookieJar — persistent cookie storage
-├── proxy.py        # Proxy rotation strategies & invalidation
+├── proxy.py        # Rotation, health/cooldown & the ProxyProvider layer
+├── identity.py     # BoundSession, IdentityPool, QuotaGate
 ├── fingerprint.py  # Browser impersonation profile table
 ├── headers.py      # Dynamic header builder & User-Agent pools
 ├── models.py       # RequestConfig dataclass & Response wrapper
@@ -541,9 +663,13 @@ Every request funnels through one pipeline:
 
 ```
 rate limit -> middleware.request -> circuit breaker -> transport
-                                                    -> middleware.response
+                                 -> validate -> middleware.response
                    middleware.error / proxy invalidation on failure
 ```
+
+`validate` sits after the breaker and inside the error path, so a rejected 200
+travels the same route a transport failure does without being able to trip the
+breaker. See "Semantic validation" above for why that separation matters.
 
 ## License
 
