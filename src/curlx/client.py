@@ -13,14 +13,19 @@ Everything except the ``await`` keywords is shared between the two.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
 
 from curl_cffi import requests as curl_requests
 
 from curlx.cookies import CookieJar
-from curlx.exceptions import ProxyError, TransportError, map_transport_error
+from curlx.exceptions import (
+    ProxyError,
+    ResponseInvalidError,
+    TransportError,
+    map_transport_error,
+)
 from curlx.fingerprint import BrowserProfile, get_profile
 from curlx.middleware import MiddlewareChain
 from curlx.models import RequestConfig, Response
@@ -67,6 +72,7 @@ class _BaseClient:
         cert: Any | None = None,
         http_version: Any | None = None,
         session_key: str | None = None,
+        validate: Callable[[Response], None] | None = None,
     ) -> None:
         self.max_concurrent = max(max_concurrent, 1)
         self.max_clients = max_clients or self.max_concurrent
@@ -79,6 +85,10 @@ class _BaseClient:
         self.allow_redirects = allow_redirects
         self.cookie_jar = cookie_jar
         self.session_key = session_key
+        # Runs on every response that reached the caller intact. Raising from it
+        # is the only way to call a structurally-fine 200 a failure - see
+        # ResponseInvalidError. None keeps the pre-validate behaviour exactly.
+        self.validate = validate
 
         if rate_limiter is not None and requests_per_second is not None:
             raise ValueError("Pass either rate_limiter or requests_per_second, not both")
@@ -128,26 +138,43 @@ class _BaseClient:
         raise ProxyError(f"Unsupported proxies type: {type(proxies)!r}")
 
     def _resolve_proxies(
-        self, session_key: str | None = None
+        self, session_key: str | None = None, host: str | None = None
     ) -> tuple[dict[str, str] | None, str | None]:
         """
         Return ``(proxy_dict, invalidatable_url)`` for the next request.
 
-        The second element is the rotator entry to retire if the request fails
-        at the transport level; it is ``None`` for a static per-scheme dict.
+        The second element is the rotator entry to retire if the request fails;
+        it is ``None`` for a static per-scheme dict.
+
+        ``host`` lets the rotator skip proxies benched for this target in
+        particular, which is a different thing from being broken outright.
         """
         if self._static_proxies is not None:
             return self._static_proxies, None
         if self.proxy_rotator is not None:
-            proxy: Proxy = self.proxy_rotator.acquire(session_key=session_key or self.session_key)
+            proxy: Proxy = self.proxy_rotator.acquire(
+                session_key=session_key or self.session_key, host=host
+            )
             return proxy.to_curl_cffi(), proxy.url
         return None, None
 
     def _handle_transport_failure(self, exc: BaseException, proxy_url: str | None) -> None:
-        """Retire the proxy that just failed, so the pool self-heals."""
+        """
+        Retire the proxy that just failed, so the pool self-heals.
+
+        Two things count as the proxy's fault. A ``TransportError`` is the
+        obvious one - the hop never completed. The other is a
+        ``ResponseInvalidError`` the caller explicitly blamed on the egress
+        path: a block page or an interstitial arrives as a perfectly healthy
+        200 over a perfectly healthy connection, so nothing at this layer can
+        recognise it. Only the caller's ``validate`` knows, which is why the
+        blame travels on the exception rather than being inferred here.
+        """
         if proxy_url is None or self.proxy_rotator is None:
             return
-        if isinstance(exc, TransportError):
+        if isinstance(exc, TransportError) or (
+            isinstance(exc, ResponseInvalidError) and exc.blames_proxy
+        ):
             self.proxy_rotator.invalidate(proxy_url)
 
     # ------------------------------------------------------------------
@@ -279,11 +306,15 @@ class AsyncHttpClient(_BaseClient):
         return self._session
 
     async def request(self, method: str, url: str, **kwargs: Any) -> Response:
+        # Popped before _build_config: an unrecognised kwarg lands in
+        # RequestConfig.extra and is forwarded to curl_cffi verbatim, which
+        # would fail on an argument it has never heard of.
+        session_key: str | None = kwargs.pop("session_key", None)
         config = self._build_config(method, url, **kwargs)
         config = await self.middleware.process_request(config)
         logger.debug("%s %s", config.method, config.url)
 
-        proxies, proxy_url = self._resolve_proxies()
+        proxies, proxy_url = self._resolve_proxies(session_key, self._host_of(config.url))
         request_kwargs = self._config_to_kwargs(config)
         if proxies is not None:
             request_kwargs["proxies"] = proxies
@@ -302,6 +333,14 @@ class AsyncHttpClient(_BaseClient):
                 resp = await self.circuit_breaker.call_async(_send)
             else:
                 resp = await _send()
+        # Inside the try, but *outside* the breaker. A backend that lies is not
+        # a backend that is down: letting rejections trip the breaker deadlocks
+        # recovery, because the warm-up request that would fix a stale identity
+        # is itself refused by the open breaker. Being inside the try is what
+        # matters - error hooks fire and a proxy-blaming rejection retires the
+        # proxy, exactly as a transport failure would.
+            if self.validate is not None:
+                self.validate(resp)
         except BaseException as exc:
             mapped = map_transport_error(exc, url=config.url)
             self._handle_transport_failure(mapped, proxy_url)
@@ -395,11 +434,13 @@ class SyncHttpClient(_BaseClient):
         return self._session
 
     def request(self, method: str, url: str, **kwargs: Any) -> Response:
+        # See the async twin: keep this out of RequestConfig.extra.
+        session_key: str | None = kwargs.pop("session_key", None)
         config = self._build_config(method, url, **kwargs)
         config = self.middleware.process_request_sync(config)
         logger.debug("%s %s", config.method, config.url)
 
-        proxies, proxy_url = self._resolve_proxies()
+        proxies, proxy_url = self._resolve_proxies(session_key, self._host_of(config.url))
         request_kwargs = self._config_to_kwargs(config)
         if proxies is not None:
             request_kwargs["proxies"] = proxies
@@ -417,6 +458,14 @@ class SyncHttpClient(_BaseClient):
                 resp = self.circuit_breaker.call(_send)
             else:
                 resp = _send()
+        # Inside the try, but *outside* the breaker. A backend that lies is not
+        # a backend that is down: letting rejections trip the breaker deadlocks
+        # recovery, because the warm-up request that would fix a stale identity
+        # is itself refused by the open breaker. Being inside the try is what
+        # matters - error hooks fire and a proxy-blaming rejection retires the
+        # proxy, exactly as a transport failure would.
+            if self.validate is not None:
+                self.validate(resp)
         except BaseException as exc:
             mapped = map_transport_error(exc, url=config.url)
             self._handle_transport_failure(mapped, proxy_url)
