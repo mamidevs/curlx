@@ -386,7 +386,15 @@ class BoundSession:
                 logger.warning("Closing the recycled client failed", exc_info=True)
 
     async def _rewarm_once(self, seen: int) -> None:
-        """Re-warm unless somebody already did since ``seen``."""
+        """
+        Re-warm unless somebody already did since ``seen``.
+
+        The generation check collapses *concurrent* repairs only. A failure
+        arriving after a repair completed legitimately repairs again - that is
+        a new problem, not a duplicate of the old one. Sequential failures
+        therefore produce sequential repairs, bounded by ``recycle_min_gap``
+        and ``max_recycles`` on the recycle path.
+        """
         async with self._warm_lock:
             if self._warm_generation != seen:
                 return
@@ -526,10 +534,11 @@ class IdentityPool:
 
     Two topology decisions, both learned the expensive way:
 
-    **The limiter is shared.** Giving each of N sessions its own limiter at
-    ``rps`` multiplies the real request rate by N. What a target measures is the
-    total, so the budget has to be a single token bucket that every session
-    draws from.
+    **The limiter is shared, and the pool enforces it.** Giving each of N
+    sessions its own limiter at ``rps`` multiplies the real request rate by N.
+    What a target measures is the total, so the budget has to be a single token
+    bucket that every session draws from - and the pool installs it on every
+    client rather than trusting the factory to remember.
 
     **The gate is not, by default.** When the quota is counted per session
     cookie, one identity running out says nothing about the others; a single
@@ -565,8 +574,10 @@ class IdentityPool:
             identities: One session is built per entry. Keys must be unique -
                 they address the session and key the sticky proxy.
             client_factory: Builds an un-entered client for an identity. The
-                shared limiter is *not* injected for you; pass it through here
-                (see :meth:`limiter`) or hand in your own via ``limiter``.
+                pool installs the shared limiter on whatever it returns, on
+                every call including recycles, so the factory does not have to
+                thread it through - but a factory that installs a *different*
+                limiter is rejected rather than overridden.
             warmup: Applied to every session.
             rps: Shared sustained rate. Ignored if ``limiter`` is given.
             burst: Bucket capacity. Defaults to ``ceil(rps)``.
@@ -600,6 +611,7 @@ class IdentityPool:
         )
         self.gate_scope = gate_scope
         shared_gate = QuotaGate() if gate_scope == "shared" else None
+        bound_factory = self._bind_limiter(client_factory)
 
         self._sessions: dict[str, BoundSession] = {}
         for identity in identities:
@@ -608,12 +620,45 @@ class IdentityPool:
             )
             self._sessions[identity.key] = BoundSession(
                 identity,
-                client_factory=client_factory,
+                client_factory=bound_factory,
                 warmup=warmup,
                 gate=gate,
                 **session_kwargs,
             )
         self._entered: list[BoundSession] = []
+
+    def _bind_limiter(
+        self, factory: Callable[[Identity], AsyncHttpClient]
+    ) -> Callable[[Identity], AsyncHttpClient]:
+        """
+        Force every client the factory produces onto the shared budget.
+
+        Without this the pool's central promise is unenforced: the limiter would
+        be an attribute nobody reads, and a caller passing ``rps=20`` with a
+        plain factory would get N clients with *no* limiter - unlimited rate,
+        which is worse than the N-times overshoot the shared budget exists to
+        prevent. It has to wrap the factory rather than patch the first client,
+        because recycling builds new ones for the session's whole life.
+
+        A factory that installed a *different* limiter is an error rather than
+        something to silently override: it means the caller believes in a budget
+        this pool is about to ignore.
+        """
+
+        def wrapped(identity: Identity) -> AsyncHttpClient:
+            client = factory(identity)
+            existing = getattr(client, "rate_limiter", None)
+            if existing is not None and existing is not self.limiter:
+                raise ValueError(
+                    f"client_factory gave identity {identity.key!r} its own rate "
+                    f"limiter, but IdentityPool shares one across every identity. "
+                    f"Pass the pool's limiter through the factory, or hand the "
+                    f"pool your limiter with limiter=."
+                )
+            client.rate_limiter = self.limiter
+            return client
+
+        return wrapped
 
     async def __aenter__(self) -> IdentityPool:
         for session in self._sessions.values():

@@ -92,13 +92,14 @@ class TestRecycleOrder:
         back wrong, which reads as drift, which triggers another recycle. A
         production crawler recycled 60 times in 30 seconds on this exact bug.
         """
-        observed: list[bool] = []
+        observed: list[tuple] = []
         session = make_session()
 
         async def warmup(client, identity):
-            # True only if the client being warmed is already the live one,
-            # i.e. the swap happened too early.
-            observed.append(client is session.client)
+            # Record both halves: which client is being warmed, and which one
+            # is live at that moment. Asserting only "they differ" would also
+            # pass if nothing were live at all.
+            observed.append((client, session.client))
             client.warmed += 1
 
         session.warmup = warmup
@@ -106,10 +107,17 @@ class TestRecycleOrder:
         async with session:
             first = session.client
             await session.recycle()
-            assert session.client is not first
+            second = session.client
 
-        # Entry warms the very first client, which is not yet live either.
-        assert observed == [False, False]
+        assert first is not second
+
+        warmed_at_entry, live_at_entry = observed[0]
+        assert warmed_at_entry is first
+        assert live_at_entry is None  # nothing is live until entry completes
+
+        warmed_at_recycle, live_at_recycle = observed[1]
+        assert warmed_at_recycle is second  # the replacement, being prepared
+        assert live_at_recycle is first  # the old one is STILL serving traffic
 
     @pytest.mark.asyncio
     async def test_old_client_is_closed_after_the_swap(self):
@@ -223,6 +231,32 @@ class TestAttemptAccounting:
                 await session.fetch("GET", "https://example.com/x")
             # One attempt only: a terminal verdict must not be retried.
             assert len(session.client.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_endless_exhaustion_eventually_raises_instead_of_spinning(self):
+        """
+        Free rounds are what keep a recycle from failing in-flight requests, but
+        free and unbounded is an infinite loop against a target that answers
+        "spent" forever. The bound has to fire.
+        """
+
+        class AlwaysSpent(FakeClient):
+            async def request(self, method, url, **kwargs):
+                await asyncio.sleep(0)
+                raise IdentityExhaustedError("budget spent")
+
+        session = BoundSession(
+            Identity("north"),
+            client_factory=lambda i: AlwaysSpent(),
+            max_attempts=2,
+            max_recycles=3,
+            recycle_min_gap=0.0,
+        )
+        session.gate.cooldown = 0.0
+        async with session:
+            with pytest.raises(IdentityExhaustedError):
+                await session.fetch("GET", "https://example.com/x")
+        assert session.stats.exhaustions == session.max_recycles + session.max_attempts + 1
 
     @pytest.mark.asyncio
     async def test_recycling_that_does_not_help_falls_back_to_waiting(self):
@@ -359,14 +393,54 @@ class TestIdentityPool:
         )
 
     @pytest.mark.asyncio
-    async def test_one_shared_limiter(self):
+    async def test_the_shared_limiter_reaches_every_client(self):
         """
         Giving each of N sessions its own limiter at `rps` multiplies the real
         rate by N. The target measures the total, so the bucket must be one.
+
+        Asserting `pool.limiter` alone would not catch the failure that matters:
+        the pool holding a limiter no client ever consults, which leaves every
+        client *unlimited*. So build real clients through the factory and check
+        the object identity.
         """
-        pool = self._pool()
+        from curlx import AsyncHttpClient
+
+        pool = IdentityPool(
+            [Identity("north"), Identity("south")],
+            client_factory=lambda i: AsyncHttpClient(),
+            rps=10,
+        )
         assert isinstance(pool.limiter, RateLimiter)
         assert pool.limiter.requests_per_second == 10
+        clients = [s.client_factory(s.identity) for s in pool]
+        assert len(clients) == 2
+        assert all(c.rate_limiter is pool.limiter for c in clients)
+
+    def test_a_factory_that_installs_its_own_limiter_is_rejected(self):
+        """Silently overriding it would hide a caller who believes in a budget
+        the pool is about to ignore."""
+        from curlx import AsyncHttpClient
+
+        pool = IdentityPool(
+            [Identity("north")],
+            client_factory=lambda i: AsyncHttpClient(rate_limiter=RateLimiter(99)),
+            rps=10,
+        )
+        session = pool["north"]
+        with pytest.raises(ValueError, match="shares one across every identity"):
+            session.client_factory(session.identity)
+
+    def test_passing_the_pools_limiter_through_the_factory_is_fine(self):
+        from curlx import AsyncHttpClient
+
+        limiter = RateLimiter(10)
+        pool = IdentityPool(
+            [Identity("north")],
+            client_factory=lambda i: AsyncHttpClient(rate_limiter=limiter),
+            limiter=limiter,
+        )
+        session = pool["north"]
+        assert session.client_factory(session.identity).rate_limiter is limiter
 
     @pytest.mark.asyncio
     async def test_gates_are_private_by_default(self):
